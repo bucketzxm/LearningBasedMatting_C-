@@ -1,0 +1,833 @@
+
+#include <iostream>
+#include <string>
+#include <math.h>
+#include <fstream>
+#include <omp.h>
+
+#include <opencv2\highgui\highgui.hpp>
+#include <opencv2\core\core.hpp>
+#include <opencv2\imgproc\imgproc.hpp>
+
+#include <Eigen/core>
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <Eigen/SparseQR>
+
+// this header file should be included after eigen
+// or an error related to "namespace Eigen" will occur 
+#include <opencv2\core\eigen.hpp>
+
+using namespace std;
+using namespace cv;
+using namespace Eigen;
+
+extern "C" void callKernel_step1(int rows, int cols, double *imdata, int *trimap, int *row_inds, int *col_inds, double *vals);
+extern "C" void callKernel_step2(int *L_rows, int *L_cols, double *L_vals, double *alpha_star, double *res, int m, int nnz);
+extern "C" void callKernel_step2_iterative(int *L_rows, int *L_cols, double *L_vals, double *alpha_star, double *res, int m, int nnz);
+extern "C" void callKernel_step2_iterative_lu(int *L_rows, int *L_cols, double *L_vals, double *alpha_star, double *res, int m, int nnz);
+
+typedef Eigen::SparseMatrix<double> SpMat;
+typedef Eigen::Triplet<double> T;
+
+#define len1  1
+#define len3  3
+#define len4  4
+#define len9  9
+#define len93  27
+#define len94  36
+#define len99  81
+
+#define c 800
+#define lambda  0.000001
+
+//======================helper function=========================//
+
+bool showImgLBDM(0), saveImgLBDM(0);
+
+bool showSavePicLBDM(string name, Mat &mat, bool flag_showSavePicLBDM, bool flag_saveImage){
+	//
+	if (flag_showSavePicLBDM){
+		cv::namedWindow(name);
+		cv::imshow(name, mat);
+		//cv::waitKey(0);
+	}
+	if (flag_saveImage){
+		std::string filePath;
+		filePath = std::string("tempPicture\\") + name + ".png";
+		cv::imwrite(filePath, mat);
+	}
+	return true;
+}
+
+//======================variable===============================//
+
+Size sz;
+int L_nnz;
+int channel = 3;
+
+//======================cpu version  ==========================//
+Mat matlab_reshape(Mat mat, int rows){
+	//
+	Mat res;
+	res = mat.t();
+	res = res.reshape(0, res.size().area() / rows);
+	res = res.t();
+
+	return res;
+}
+Mat matlab_colVector(Mat mat){
+	//
+	Mat tmp = mat.clone();
+	tmp = tmp.t();
+	tmp = tmp.reshape(0, 1);	//keep channels, change to 1 row!
+	tmp = tmp.t();
+
+	return tmp;
+}
+
+void addCol(Mat& m, size_t sz, const Scalar& s)
+{
+	Mat tm(m.rows, m.cols + sz, m.type());
+	tm.setTo(s);
+	m.copyTo(tm(Rect(Point(0, 0), m.size())));
+	m = tm;
+}
+
+Mat createPixInds(Size sz){
+	//
+	Mat ap(sz.width, sz.height, CV_32SC1);
+
+	Mat_<int>::iterator it = ap.begin<int>();
+	Mat_<int>::iterator end = ap.end<int>();
+
+	for (int i = 0; it != end; ++it, ++i){
+		*it = i;
+	}
+
+	ap = ap.t();
+
+	//cout << ap << endl;
+
+	return ap;
+}
+
+Mat compLapCoeff(Mat winI){
+
+	Mat Xi, I;
+	Xi = winI.clone();
+	addCol(Xi, 1, Scalar::all(1));
+	//cout << "Xi:\n" << Xi << endl; 
+
+	I = Mat::eye(Xi.rows, Xi.rows, CV_64FC1);
+	I.at<double>(I.rows - 1, I.cols - 1) = 0;
+	//cout << "I:\n" << I << endl; 
+
+	Mat fenmu, F, I_F, lapcoeff;
+
+	Mat Xi_t = Xi.t();
+	Mat tmp1 = Xi*Xi_t;
+	//cout << "tmp1:\n" << tmp1 << endl;
+	Mat tmp2 = lambda*I;
+	fenmu = tmp1 + tmp2;
+	//cout << "fenumu:\n" << fenmu << endl; 
+
+	//F = (Xi*Xi.t()) / fenmu;
+	//F = fenmu.inv(DECOMP_SVD)*tmp1;
+	solve(fenmu, tmp1, F, DECOMP_SVD);
+
+	//F = fenmu.inv() * tmp1;
+	//cout << "F:\n" << F << endl;
+	F = F.t();
+
+	I_F = Mat::eye(F.rows, F.rows, CV_64FC1) - F;
+	//cout << "I_F:\n" << I_F << endl; 
+
+	lapcoeff = I_F.t() * I_F;
+	//cout << "lapcoeff:\n" << lapcoeff << endl; 
+
+	Mat tmp = lapcoeff.clone();
+	tmp.convertTo(tmp, CV_8S, 1, 0);
+	//cout << tmp << endl;
+
+	return lapcoeff;
+}
+
+//======================cuda version  =========================//
+
+
+SpMat creEigenMat_cuda(int *row_inds, int *col_inds, double *vals, Size sz)
+{
+	std::vector<T> tripletList;
+	tripletList.reserve(65535);
+
+	cout << "unsuitable value: " << endl;
+	double x, y, v_xy;
+	for (int i = 0; i < sz.width * sz.height * len99; ++i)
+	{
+		y = row_inds[i];
+		x = col_inds[i];
+		v_xy = vals[i];
+
+		if (x<0 || x>sz.area() - 1)
+			cout << "x: " << x << endl;
+			
+		if (y<0 || y>sz.area() - 1)
+			cout << "y: " << y << endl;
+
+		//cout << "x: " << x << "\t"
+		//	<< "y: " << y << "\t"
+		//	<< "v_xy: " << v_xy << endl;
+		//waitKey(0);
+
+
+		if (x && y)
+			tripletList.push_back(T(x, y, v_xy));
+	}
+
+	SpMat mat(sz.area(), sz.area());
+	mat.setFromTriplets(tripletList.begin(), tripletList.end());
+
+	return mat;
+}
+
+void getDDImgData(double *data, Mat image)
+{
+	int nr = image.rows;
+	int nc = image.cols * image.channels();
+
+	if (image.isContinuous())
+	{
+		nc = nr * nc;
+		nr = 1;
+	}
+
+	for (int j = 0; j < nr; ++j)
+	{
+		double *p = image.ptr<double>(j);
+		for (int i = 0; i < nc; ++i)
+		{
+			data[j*nc + i] = p[i];
+		}
+	}
+}
+
+void getUIImgData(int *data, Mat image)
+{
+	int nr = image.rows;
+	int nc = image.cols * image.channels();
+
+	if (image.isContinuous())
+	{
+		nc = nr * nc;
+		nr = 1;
+	}
+
+	for (int j = 0; j < nr; ++j)
+	{
+		uchar *p = image.ptr<uchar>(j);
+		for (int i = 0; i < nc; ++i)
+		{
+			data[j*nc + i] = (unsigned)p[i];
+		}
+	}
+}
+
+void getIDImgData(double *data, Mat image)
+{
+	int nr = image.rows;
+	int nc = image.cols * image.channels();
+
+	if (image.isContinuous())
+	{
+		nc = nr * nc;
+		nr = 1;
+	}
+	int cc = 0;
+	for (int j = 0; j < nr; ++j)
+	{
+		int *p = image.ptr<int>(j);
+		for (int i = 0; i < nc; ++i)
+		{
+			data[j*nc + i] = (double)p[i];
+			cc = j*nc + i;
+		}
+	}
+}
+
+void arrangeL(int *row_inds, int *col_inds, double *vals, Mat C){
+	//
+	std::vector<tuple<int, int, double>> tupleVec;
+	tupleVec.reserve(655350);
+
+	int x, y;
+	double v_xy;
+
+	for (int i = 0; i < sz.width * sz.height * len99; ++i)
+	{
+		y = row_inds[i];
+		x = col_inds[i];
+		v_xy = vals[i];
+
+		if (x<=0 || x>=sz.area() - 1){
+			//cout << "x: " << x << endl;
+			continue;
+		}
+
+		if (y<=0 || y>=sz.area() - 1){
+			//cout << "y: " << y << endl;
+			continue;
+		}
+		
+		//if (x == y)
+		//	tupleVec.push_back(make_tuple(y, x, v_xy + c));
+		//else
+		//	tupleVec.push_back(make_tuple(y, x, v_xy));
+		tupleVec.push_back(make_tuple(y, x, v_xy));
+	}
+
+	for (int t = 0; t < sz.width * sz.height; ++t)
+		tupleVec.push_back(make_tuple(t, t, lambda));
+
+	Mat tmp = C.t();
+	for (int j = 0; j < tmp.rows; ++j)
+	{
+		for (int i = 0; i < tmp.cols; ++i)
+		{
+			if ( abs(tmp.at<double>(j, i)) > 0.1 )
+				tupleVec.push_back(make_tuple( j*tmp.cols + i, j*tmp.cols + i, tmp.at<double>(j, i)));
+		}
+	}
+
+	sort(tupleVec.begin(), tupleVec.end());
+	cout << "L is re arranged!!!" << endl;
+
+	int i = 0;
+	int old_row = -1, old_col = -1, new_row = 0, new_col = 0;
+	double old_val, new_val;
+	
+	for (auto p : tupleVec)
+	{
+		new_row = get<0>(p);
+		new_col = get<1>(p);
+		new_val = get<2>(p);
+
+		//if (new_row == new_col)
+		//	printf("(%d,%d) v:%f\n", new_row, new_col, new_val);
+
+		if ((new_row == old_row) && (new_col == old_col))
+		{
+			vals[i-1] += new_val;
+		}
+		else
+		{// 1-based index is required!
+			row_inds[i] = new_row;
+			col_inds[i] = new_col;
+			vals[i++] = new_val;
+		}
+		old_row = new_row;
+		old_col = new_col;
+		old_val = new_val;
+	}
+	
+	L_nnz = i;
+	cout << "L_nnz: " << L_nnz << endl;
+
+	//for (int i = 0; i < 1000; ++i)
+	//{
+	//	cout << row_inds[i] << "\t"
+	//		<< col_inds[i] << "\t"
+	//		<< vals[i] << endl;
+	//}
+}
+
+void getLap_iccv09_overlapping_cuda(Mat imdata, Size winsz, Mat mask, Mat C,
+	double *&L_vals, int *&L_rows, int *&L_cols)
+{
+	imdata.convertTo(imdata, CV_64FC3, 1.0 / 255, 0);
+	int numPixInWindow = winsz.area();
+
+	//
+	Mat scribble_mask;
+	scribble_mask = (abs(mask) != 0);
+
+	Mat element(winsz, CV_8U, Scalar(1));
+	erode(scribble_mask, scribble_mask, element);
+
+	//
+	double *image = (double *)malloc(sz.width * sz.height * channel * sizeof(double));
+	int *trimap	  = (int *)malloc(sz.width * sz.height * sizeof(int));
+
+	getDDImgData(image, imdata);
+	getUIImgData(trimap, scribble_mask);
+	
+	int *row_inds	= (int *)malloc(sz.width * sz.height * len99 * sizeof(int));
+	int *col_inds	= (int *)malloc(sz.width * sz.height * len99 * sizeof(int));
+	double *vals    = (double *)malloc(sz.width * sz.height * len99 * sizeof(double));
+
+	memset(row_inds, 0, sz.width * sz.height * len99 * sizeof(int));
+	memset(col_inds, 0, sz.width * sz.height * len99 * sizeof(int));
+	memset(vals, 0, sz.width * sz.height * len99 * sizeof(double));
+
+	//call cuda kernel function
+	callKernel_step1(imdata.rows, imdata.cols, image, trimap, row_inds, col_inds, vals);
+	
+	//arrange matrix 
+	arrangeL(row_inds, col_inds, vals, C);
+
+	L_rows = row_inds;
+	L_cols = col_inds;
+	L_vals = vals;
+
+	free(image);
+	free(trimap);
+}
+
+void getLap_cuda(Mat imdata, Size winsz, Mat mask, Mat C, int *&L_rows, int *&L_cols, double *&L_vals){
+	//
+	cout << "Computing Laplacian matrix ... ..." << endl;
+	getLap_iccv09_overlapping_cuda(imdata, winsz, mask, C, L_vals, L_rows, L_cols);
+	return ;
+}
+
+Mat getC_cuda(Mat mask){
+	//
+	cout << "Computing regularization matrix ... ..." << endl;
+
+	Mat scribble_mask;
+	scribble_mask = (abs(mask) != 0);
+
+	double rate = 1.0 / 255;
+	//double rate = 1;
+	scribble_mask.convertTo(scribble_mask, CV_64FC1, rate, 0);
+	scribble_mask = c * scribble_mask;
+
+	return scribble_mask;
+}
+
+Mat getAlpha_star_cuda(Mat mask){
+	//
+	cout << "Computing preknown alpha values ... ..." << endl;
+
+	Mat alpha_star;
+	alpha_star = Mat::zeros(mask.size(), CV_32SC1);
+
+	Mat mask_pos, mask_neg;
+	mask_pos = mask > 0;
+	mask_neg = mask < 0;
+
+	alpha_star.setTo(1, mask_pos);
+	alpha_star.setTo(-1, mask_neg);
+
+	alpha_star = c * alpha_star;
+
+	return alpha_star;
+}
+
+Mat solveQurdOpt_cuda(int *L_rows, int *L_cols, double *L_vals, Mat C, Mat as)
+{
+	cout << "solving quadratic optimization proble .............." << endl;
+
+	int m = sz.width * sz.height;
+
+	double *alpha;
+	alpha = (double *)malloc( m * sizeof(double));
+	memset(alpha, 0, m * sizeof(double));
+
+	double *alpha_star;
+	alpha_star = (double *)malloc( m * sizeof(double));
+	getIDImgData(alpha_star, as.t());
+	
+	//callKernel_step2(L_rows, L_cols, L_vals, alpha_star, alpha, m, L_nnz);
+	callKernel_step2_iterative(L_rows, L_cols, L_vals, alpha_star, alpha, m, L_nnz);
+	
+	Mat cvAlpha = Mat(m, 1, CV_64FC1, alpha).clone();
+	cvAlpha = cvAlpha.reshape(0, sz.width);
+	cvAlpha = cvAlpha.t();
+
+	showSavePicLBDM("alpha", cvAlpha, showImgLBDM, saveImgLBDM);
+
+	cvAlpha = cvAlpha*0.5 + 0.5;
+
+	cvAlpha = max(min(cvAlpha, 1.0), 0.0);
+
+	free(alpha);
+	free(alpha_star);
+	return cvAlpha;
+}
+
+Mat learningBasedMatting_cuda(Mat imdata, Mat mask){
+	//
+	Size winsz = Size(3, 3);
+	
+	double *L_val;
+	int *L_row, *L_col;
+
+	Mat C, alpha_star;
+	C = getC_cuda(mask);
+
+	alpha_star = getAlpha_star_cuda(mask);
+
+	getLap_cuda(imdata, winsz, mask, C, L_row, L_col, L_val);
+
+	Mat alpha = solveQurdOpt_cuda(L_row, L_col, L_val, C, alpha_star);
+
+	return alpha;
+}
+
+//======================core function=========================//
+
+SpMat creEigenMat(vector<int> &row_inds, vector<int> &col_inds, vector<double> &vals)
+{
+	std::vector<T> tripletList;
+	tripletList.reserve(65535);
+
+	double x, y, v_xy;
+
+	for (int i = 0; i < row_inds.size(); ++i)
+	{
+		y = row_inds[i];
+		x = col_inds[i];
+		v_xy = vals[i];
+
+		tripletList.push_back(T(x, y, v_xy));
+	}
+
+	SpMat mat(sz.area(), sz.area());
+	mat.setFromTriplets(tripletList.begin(), tripletList.end());
+
+	return mat;
+}
+
+SpMat getLap_iccv09_overlapping(Mat imdata, Size winsz, Mat mask){
+	//
+	imdata.convertTo(imdata, CV_64FC3, 1.0 / 255, 0);
+	int d = imdata.channels();
+	Mat pixInds = createPixInds(sz);
+
+	//
+	int numPixInWindow = winsz.area();
+	Size halfwinsz = Size(winsz.width / 2, winsz.height / 2);
+
+	//
+	Mat scribble_mask;
+	scribble_mask = (abs(mask) != 0);
+	//showSavePicLBDM("scribble_mask", scribble_mask, showImgLBDM, saveImgLBDM);
+
+	Mat element(winsz, CV_8U, Scalar(1));
+	erode(scribble_mask, scribble_mask, element);
+	showSavePicLBDM("scribble_mask", scribble_mask, showImgLBDM, saveImgLBDM);
+
+	////
+	//Mat tmp;
+	//Point p1, p2;
+	//p1 = Point(halfwinsz.width + 1, halfwinsz.height + 1);
+	//p2 = Point(scribble_mask.cols - halfwinsz.width - 1, scribble_mask.rows - halfwinsz.height - 1);
+	//tmp = scribble_mask(Rect(p1, p2));
+	//tmp = 1 - scribble_mask;
+	//showSavePicLBDM("tmp", tmp, showImgLBDM, saveImgLBDM);
+	//int numPix4Training = sum(sum(tmp))[0];
+	//int numNonzeroValue = numPix4Training * pow(numPixInWindow, 2);
+
+
+	vector<int> row_inds;
+	vector<int> col_inds;
+	vector<double> vals;
+
+	row_inds.reserve(65535);
+	col_inds.reserve(65535);
+	vals.reserve(65535);
+
+	////int len = 0;
+	//for (int j = halfwinsz.width; j < imsz.width - halfwinsz.width; ++j){
+	//	for (int i = halfwinsz.height; i < imsz.height - halfwinsz.height; ++i){
+	//		//
+	//		//cout << "(" << j << "," << i << ")" << endl;
+	//		//cout << j << "\t" << i << endl;
+	//		if (uchar a = scribble_mask.at<uchar>(i, j))
+	//			continue;
+
+	//===============================================////===============================================//
+	double startStage, endStage;
+	startStage = static_cast<double>(getTickCount());
+	//===============================================//
+
+	//int len = 0;
+	for (int j = halfwinsz.height; j < sz.height - halfwinsz.height; ++j){
+		for (int i = halfwinsz.width; i < sz.width - halfwinsz.width; ++i){
+			//
+			//cout << "(" << j << "," << i << ")" << endl;
+			//cout << j << "\t" << i << endl;
+			if (uchar a = scribble_mask.at<uchar>(j, i))
+				continue;
+
+			Point p1, p2;
+			p1 = Point(i - halfwinsz.width, j - halfwinsz.height);
+			p2 = Point(i + halfwinsz.width + 1, j + halfwinsz.height + 1);
+			//cout << "1: p1" << p1 << "p2" << p2 << endl;
+
+			Mat winData = imdata(Rect(p1, p2)).clone();	//
+			//cout << "winData:initial" << winData << endl;
+			//winData = winData.reshape(1, numPixInWindow);
+			winData = matlab_reshape(winData, numPixInWindow);
+			winData = winData.reshape(1);
+			//cout << "winData:reshape/n" << winData << endl;
+
+			Mat lapcoeff = compLapCoeff(winData);
+
+			Mat win_inds = pixInds(Rect(p1, p2));
+			//cout << "win_inds:/n" << win_inds << endl;
+
+			//Mat row_incre = repeat(win_inds, 1, numPixInWindow).reshape(0, numPixInWindow);
+			Mat rep_row = repeat(matlab_colVector(win_inds), 1, numPixInWindow);
+			Mat row_incre = matlab_reshape(rep_row, numPixInWindow*numPixInWindow);
+			//cout << "\n" << row_incre << endl;
+			row_inds.insert(row_inds.end(), row_incre.begin<int>(), row_incre.end<int>());
+
+			//Mat col_incre = repeat(win_inds.t(), numPixInWindow, 1).reshape(0, numPixInWindow);
+			Mat rep_col = repeat(matlab_colVector(win_inds).t(), numPixInWindow, 1);
+			Mat col_incre = matlab_reshape(rep_col, numPixInWindow*numPixInWindow);
+			col_inds.insert(col_inds.end(), col_incre.begin<int>(), col_incre.end<int>());
+
+			lapcoeff = lapcoeff.t();
+			//cout << "lapcoeff:\n" << lapcoeff << endl;
+			vals.insert(vals.end(), lapcoeff.begin<double>(), lapcoeff.end<double>());
+		}
+	}
+
+
+	//===============================================//
+	endStage = static_cast<double>(getTickCount()) - startStage;
+	endStage /= getTickFrequency();
+	cout << "time consumption on CPU: " << endStage << endl;
+	//===============================================////===============================================//
+
+	SpMat res;
+	//cout << "res:" << endl;
+	//copy(vals.begin(), vals.begin()+100, ostream_iterator<double>(cout, " "));
+	res = creEigenMat(row_inds, col_inds, vals);
+
+	return res;
+}
+
+Mat getMask_onlineEvaluation(Mat I){
+	//
+	Mat mask, fore, back;
+	showSavePicLBDM("I", I, showImgLBDM, saveImgLBDM);
+
+	mask = Mat::zeros(I.size(), CV_8SC1);//////////////////////////////////////////////
+	mask.setTo(0);
+	showSavePicLBDM("mask", mask, showImgLBDM, saveImgLBDM);
+
+	fore = (I == 255);
+	back = (I == 0);
+	//showSavePicLBDM("fore", fore, showImgLBDM, saveImgLBDM);
+	//showSavePicLBDM("back", back, showImgLBDM, saveImgLBDM);
+
+	// << I.depth() << "\t" << I.type() << endl; 
+	//cout << fore.depth() << "\t" << fore.type() << endl;
+
+	mask.setTo(1, fore);
+	mask.setTo(-1, back);
+
+
+	showSavePicLBDM("mask", mask, showImgLBDM, saveImgLBDM);
+
+	return mask;
+}
+
+SpMat getLap(Mat imdata, Size winsz, Mat mask){
+	//
+	cout << "Computing Laplacian matrix ... ..." << endl;
+	SpMat L = getLap_iccv09_overlapping(imdata, winsz, mask);
+	return L;
+}
+
+SpMat getC(Mat mask){
+	//
+	cout << "Computing regularization matrix ... ..." << endl;
+
+	Mat scribble_mask;
+	scribble_mask = (abs(mask) != 0);
+	scribble_mask.convertTo(scribble_mask, CV_64FC1, 1.0 / 255, 0);
+
+	scribble_mask = matlab_colVector(scribble_mask);
+
+	//scribble_mask元素总数
+	int numPix = mask.cols * mask.rows;
+
+	//对角阵
+	SpMat diagnal(numPix, numPix);
+	diagnal.reserve(Eigen::VectorXd::Constant(numPix, 2));	//为每一列预先保留的空间数量
+
+	//为对角阵插入元素，插入位置为主对角线
+	for (int i = 0; i < numPix; ++i){
+		diagnal.insert(i, i) = scribble_mask.at<double>(i);
+		//cout << nr << "\t" << nc << "values:" << scribble_mask.at<double>(nr, nc) << endl;
+	}
+
+	//
+	SpMat C = (double)c * diagnal;
+
+	return C;
+}
+
+Mat getAlpha_star(Mat mask){
+	//
+	cout << "Computing preknown alpha values ... ..." << endl;
+
+	Mat alpha_star;
+	alpha_star = Mat::zeros(mask.size(), CV_8SC1);
+
+	Mat mask_pos, mask_neg;
+	mask_pos = mask > 0;
+	mask_neg = mask < 0;
+
+	alpha_star.setTo(1, mask_pos);
+	alpha_star.setTo(-1, mask_neg);
+
+	return alpha_star;
+
+	//for(int j=0;j<mask.rows;++j){
+	//	//
+	//	for(int i=0; i<mask.cols; ++i){
+	//		//
+	//		if( mask.at<int>(j, i)>0 )
+	//			alpha_star.insert(j, i) = 1;
+	//		else if( mask.at<int>(j, i)<0 )
+	//			alpha_star.insert(j, i) = -1;
+	//	}
+	//}
+}
+
+Mat solveQurdOpt(SpMat L, SpMat C, Mat alpha_star){
+	//
+	cout << "solving quadratic optimization proble .............." << endl;
+
+	Eigen::initParallel();
+
+	omp_set_num_threads(8);
+	Eigen::setNbThreads(8);
+
+	SpMat D(L.rows(), L.cols());
+	D.setIdentity();
+	//cout << D << endl;
+
+	alpha_star = matlab_colVector(alpha_star);
+	MatrixXd as_dense;
+	cv2eigen(alpha_star, as_dense);
+	SpMat b = as_dense.sparseView();
+
+
+	SpMat A, alpha;
+	A = L + C + lambda * D;
+	b = C * b;
+	//cout << b << endl; 
+
+	Eigen::SimplicialLLT<SpMat> solver;
+	//Eigen::SimplicialLDLT<SpMat> solver;
+	//Eigen::SparseQR<Eigen::SparseMatrix<double>> solver;
+	//Eigen::BiCGSTAB<SpMat> solver;
+	solver.compute(A);
+	if (solver.info() != Eigen::Success) {
+		cout << "decomposition failed" << endl;
+	}
+	cout << "decomposition success" << endl;
+
+	cout << "begin to solve !" << endl;
+	alpha = solver.solve(b);
+	cout << "solve success" << endl;
+
+	Mat cvAlpha;
+	eigen2cv(Eigen::MatrixXd(alpha), cvAlpha);
+
+	cvAlpha = cvAlpha.reshape(0, sz.width);
+	cvAlpha = cvAlpha.t();
+
+	showSavePicLBDM("alpha", cvAlpha, showImgLBDM, saveImgLBDM);
+
+	cvAlpha = cvAlpha*0.5 + 0.5;
+
+	cvAlpha = max(min(cvAlpha, 1.0), 0.0);
+
+	return cvAlpha;
+}
+
+Mat learningBasedMatting(Mat imdata, Mat mask){
+	//
+	Size winsz = Size(3, 3);
+
+
+	SpMat L, C;
+	Mat alpha_star;
+
+	L = getLap(imdata, winsz, mask);
+
+	C = getC(mask);
+
+	alpha_star = getAlpha_star(mask);
+
+	Mat alpha = solveQurdOpt(L, C, alpha_star);
+
+	return alpha;
+}
+
+Mat LBDM_Matting(Mat imdata, Mat raw_mask){
+
+	sz = imdata.size();
+
+	cout << imdata.channels() << endl;
+	cout << raw_mask.channels() << endl;
+	showSavePicLBDM("imdata", imdata, showImgLBDM, saveImgLBDM);
+	showSavePicLBDM("raw_mask", raw_mask, showImgLBDM, saveImgLBDM);
+
+	//===============================================////===============================================//
+	double startStage, endStage, duration;
+	startStage = static_cast<double>(getTickCount());
+	//===============================================//
+
+	cvtColor(imdata, imdata, COLOR_BGR2RGB);
+
+	showSavePicLBDM("imdata", imdata, showImgLBDM, saveImgLBDM);
+
+	Mat mask = getMask_onlineEvaluation(raw_mask);
+
+	Mat alpha = learningBasedMatting(imdata, mask);
+
+	//===============================================//
+	endStage = static_cast<double>(getTickCount());
+	duration = (endStage - startStage) / getTickFrequency();
+	cout << "total duration: " << duration << "s" << endl;
+	//===============================================////===============================================//
+	
+
+	return alpha;
+}
+
+////
+int main()
+{
+	Mat mat, trimap;
+	//mat = imread("inputPic\\doll_very_small.png", IMREAD_COLOR);
+	//trimap = imread("inputTrimap\\doll_very_small.png", IMREAD_GRAYSCALE);
+
+	//mat = imread("inputPic\\plasticbag_small.png", IMREAD_COLOR);
+	//trimap = imread("inputTrimap\\plasticbag_small.png", IMREAD_GRAYSCALE);
+
+	mat = imread("inputPic\\plasticbag_1.png", IMREAD_COLOR);
+	trimap = imread("inputTrimap\\plasticbag_1.png", IMREAD_GRAYSCALE);
+
+	//mat = imread("inputPic\\doll_020.png", IMREAD_COLOR);
+	//trimap = imread("inputTrimap\\doll_020.png", IMREAD_GRAYSCALE);
+
+	if (!mat.data || !trimap.data)
+		return -1;
+
+	showSavePicLBDM("mat", mat, 1, 0);
+	showSavePicLBDM("trimap", trimap, 1, 0);
+	
+	Mat alpha = LBDM_Matting(mat, trimap);
+
+	showSavePicLBDM("alpha2", alpha, 1, 0);
+	waitKey(0);
+}
